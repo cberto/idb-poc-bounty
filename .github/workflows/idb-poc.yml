@@ -108,11 +108,25 @@ jobs:
             echo "Bind to 127.0.0.1.10882        =>  localhost-only (would be secure)"
           } | tee /Users/runner/evidence/evidence-bind.txt
 
-          # PROOF 2 — unauth list-targets
+          # PROOF 2 — unauth list-targets from 127.0.0.1
           {
             echo "=== IDB_COMPANION=127.0.0.1:10882 idb list-targets (NO AUTH, NO TLS) ==="
             IDB_COMPANION=127.0.0.1:10882 /Users/runner/idb-venv/bin/idb list-targets 2>&1
           } | tee /Users/runner/evidence/evidence-unauth-list.txt
+
+          # PROOF 2-BIS — connect from NON-LOOPBACK runner IP (proves network-reachable, not just localhost)
+          RUNNER_IP=$(ifconfig | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}')
+          {
+            echo "=== Runner non-loopback IP: $RUNNER_IP ==="
+            echo "=== netstat -an confirming bind on all interfaces ==="
+            netstat -an -p tcp | grep 10882 || true
+            echo ""
+            echo "=== IDB_COMPANION=$RUNNER_IP:10882 idb list-targets ==="
+            IDB_COMPANION=$RUNNER_IP:10882 /Users/runner/idb-venv/bin/idb list-targets 2>&1 | head -10
+            echo ""
+            echo "If the above returned targets, the daemon IS reachable from non-loopback addresses"
+            echo "= confirmed: bind is NOT localhost-only, it accepts connections from any interface"
+          } | tee /Users/runner/evidence/evidence-network-reachable.txt
 
           # PROOF 3 — describe (target metadata exfil)
           {
