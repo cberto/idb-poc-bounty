@@ -51,9 +51,22 @@ jobs:
       - name: Create + boot iOS Simulator
         run: |
           set -e
-          RUNTIME=$(xcrun simctl list runtimes -j | python3 -c "import json,sys; d=json.load(sys.stdin); rts=[r for r in d['runtimes'] if r['isAvailable'] and 'iOS' in r['name']]; print(rts[0]['identifier'])")
+          # Pick newest iOS runtime + a device type the runtime explicitly supports
+          PAIR=$(xcrun simctl list runtimes -j | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          rts=[r for r in d['runtimes'] if r['isAvailable'] and 'iOS' in r['name']]
+          rts.sort(key=lambda r: r['version'], reverse=True)
+          r=rts[0]
+          # supportedDeviceTypes is a list of {identifier, name, productFamily}
+          dts=[d for d in r.get('supportedDeviceTypes', []) if 'iPhone' in d.get('name','')]
+          if not dts:
+              dts=r['supportedDeviceTypes']
+          print(r['identifier'] + '|' + dts[-1]['identifier'])
+          ")
+          RUNTIME=${PAIR%%|*}
+          DEVICE_TYPE=${PAIR##*|}
           echo "Using runtime: $RUNTIME"
-          DEVICE_TYPE=$(xcrun simctl list devicetypes -j | python3 -c "import json,sys; d=json.load(sys.stdin); dts=[dt for dt in d['devicetypes'] if 'iPhone' in dt['name']]; print(dts[-1]['identifier'])")
           echo "Using device type: $DEVICE_TYPE"
           UDID=$(xcrun simctl create "PoC-iPhone" "$DEVICE_TYPE" "$RUNTIME")
           echo "Created sim UDID: $UDID"
